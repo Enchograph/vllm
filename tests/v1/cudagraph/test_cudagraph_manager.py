@@ -23,6 +23,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.spec_decode.dflash import cudagraph as dflash_cudagraph
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import (
     cudagraph_utils as spec_cudagraph_utils,
 )
@@ -259,6 +260,54 @@ def test_speculator_capture_preserves_decode_query_bounds(
     assert model_state.prepare_attn.call_count == 2
     for call in model_state.prepare_attn.call_args_list:
         assert call.args[0].max_query_len == expected_max_query_len
+
+
+def test_dflash_capture_forwards_positions_and_cpu_seq_lens():
+    num_reqs = 2
+    num_tokens = 4
+    input_buffers = InputBuffers(4, 8, torch.device("cpu"))
+    block_tables = MagicMock(cp_size=1)
+    block_tables.get_dummy_block_tables.return_value = (
+        torch.zeros(num_reqs, 1, dtype=torch.int32),
+    )
+    block_tables.get_dummy_slot_mappings.return_value = torch.zeros(
+        1, num_tokens, dtype=torch.int64
+    )
+
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=["layer"])]
+    )
+    metadata_builder = SimpleNamespace(
+        supports_update_block_table=False,
+        build_for_cudagraph_capture=lambda metadata: metadata,
+    )
+    attn_group = SimpleNamespace(
+        layer_names=["layer"],
+        kv_cache_spec=None,
+        get_metadata_builder=lambda _: metadata_builder,
+    )
+
+    attn_metadata, _ = dflash_cudagraph._prepare_dflash_inputs_to_capture(
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+        input_buffers=input_buffers,
+        block_tables=block_tables,
+        attn_groups=[[attn_group]],
+        kv_cache_config=kv_cache_config,
+        max_model_len=8,
+        skip_attn=False,
+        causal=True,
+    )
+
+    common_attn_metadata = attn_metadata["layer"]
+    assert common_attn_metadata.positions.shape == (num_tokens,)
+    assert (
+        common_attn_metadata.positions.data_ptr() == input_buffers.positions.data_ptr()
+    )
+    cpu_seq_lens = common_attn_metadata.seq_lens_cpu_upper_bound
+    assert cpu_seq_lens.device.type == "cpu"
+    assert cpu_seq_lens.dtype == torch.int32
+    assert cpu_seq_lens.tolist() == [2, 2]
 
 
 _DECODE_QUERY_LEN = 3
